@@ -11,7 +11,7 @@ import { XYPushService } from "../transport/push.js";
 import { getAllPushIds } from "../utils/pushid-manager.js";
 import { getOrCreateConvId } from "../utils/cron-conv-map.js";
 import { recordSentStreamingTextId } from "../utils/streaming-text-id.js";
-import { logger, isA2AOutLogEnabled } from "../utils/logger.js";
+import { logger, isA2AOutLogEnabled, type ScopedLogger } from "../utils/logger.js";
 import type {
   XYChannelConfig,
   OutboundWebSocketMessage,
@@ -19,6 +19,8 @@ import type {
 } from "../types.js";
 
 // ─── WebSocket A2A 帧发送 ─────────────────────────────────────
+
+const CRON_RUNS_MAX_FRAME_BYTES = 64 * 1024;
 
 export interface SendWsFrameParams {
   config: XYChannelConfig;
@@ -42,6 +44,79 @@ function isMemoryFileReadCommand(command: A2ACommand): boolean {
   return command?.header?.namespace === "AgentEvent"
     && command?.header?.name === "MemoryQuery"
     && command?.payload?.action === "MemoryFileRead";
+}
+
+function isCronRunsResponse(command: A2ACommand): boolean {
+  return command?.header?.namespace === "AgentEvent"
+    && command?.header?.name === "CronQuery"
+    && command?.payload?.action === "runs";
+}
+
+/** Fit a history page using the exact JSON that the WebSocket manager sends. */
+function fitCronRunsFrame(
+  frame: Record<string, any>,
+  message: OutboundWebSocketMessage,
+  hostname: string,
+  log: ScopedLogger,
+): Record<string, any> {
+  const commands = extractCommands(frame);
+  const commandIndex = commands.findIndex(isCronRunsResponse);
+  if (commandIndex < 0) return frame;
+
+  const originalBytes = Buffer.byteLength(JSON.stringify(message), "utf8");
+  const answer = commands[commandIndex].payload.ans;
+  const entries = Array.isArray(answer?.entries) ? answer.entries : [];
+  const details = `offset=${answer?.offset ?? "-"} originalEntries=${entries.length} originalBytes=${originalBytes} maxBytes=${CRON_RUNS_MAX_FRAME_BYTES}`;
+  if (originalBytes <= CRON_RUNS_MAX_FRAME_BYTES) {
+    log.log(`[CRON-RUNS-WS-SIZE] ${details} outcome=unchanged`);
+    return frame;
+  }
+
+  const fittedFrame = structuredClone(frame);
+  const { payload } = extractCommands(fittedFrame)[commandIndex];
+  const serializePage = (count: number) => {
+    payload.ans = {
+      ...answer,
+      entries: entries.slice(0, count),
+      limit: count,
+      hasMore: true,
+      nextOffset: answer.offset + count,
+    };
+    message.msgDetail = JSON.stringify({ ...fittedFrame, hostname });
+    return Buffer.byteLength(JSON.stringify(message), "utf8");
+  };
+
+  // Every candidate is a strict prefix. Search for the largest one that fits.
+  let fittingCount = 0;
+  let low = 1;
+  let high = entries.length - 1;
+  while (low <= high) {
+    const count = Math.floor((low + high) / 2);
+    if (serializePage(count) <= CRON_RUNS_MAX_FRAME_BYTES) {
+      fittingCount = count;
+      low = count + 1;
+    } else {
+      high = count - 1;
+    }
+  }
+
+  if (fittingCount > 0) {
+    const sentBytes = serializePage(fittingCount);
+    log.warn(`[CRON-RUNS-WS-SIZE] ${details} outcome=resized sentEntries=${fittingCount} sentBytes=${sentBytes} nextOffset=${payload.ans.nextOffset}`);
+    return fittedFrame;
+  }
+
+  const error = "CronQuery.runs response exceeds the 64 KiB WebSocket frame limit";
+  payload.status = false;
+  payload.ans = { error };
+  message.msgDetail = JSON.stringify({ ...fittedFrame, hostname });
+  const errorBytes = Buffer.byteLength(JSON.stringify(message), "utf8");
+  if (errorBytes > CRON_RUNS_MAX_FRAME_BYTES) {
+    log.error(`[CRON-RUNS-WS-SIZE] ${details} outcome=rejected errorBytes=${errorBytes}`);
+    throw new Error(error);
+  }
+  log.warn(`[CRON-RUNS-WS-SIZE] ${details} outcome=error sentBytes=${errorBytes}`);
+  return fittedFrame;
 }
 
 /**
@@ -138,14 +213,16 @@ export async function sendWsFrame(params: SendWsFrameParams): Promise<void> {
   const wsManager = getXYWebSocketManager(config);
   const log = logger.withContext(sessionId, taskId);
 
-  for (const frame of splitMixedReasoningFrames(payload)) {
+  for (const candidate of splitMixedReasoningFrames(payload)) {
+    const hostname = os.hostname();
     const outboundMessage: OutboundWebSocketMessage = {
       msgType: "agent_response",
       agentId: config.agentId,
       sessionId,
       taskId,
-      msgDetail: JSON.stringify({ ...frame, hostname: os.hostname() }),
+      msgDetail: JSON.stringify({ ...candidate, hostname }),
     };
+    const frame = fitCronRunsFrame(candidate, outboundMessage, hostname, log);
     // 出站 A2A 日志（受 index.ts 的 A2A_OUT_LOG_ENABLED 常量开关控制，关闭时
     // 整块跳过，省掉 buildLoggableMsgDetail / extractCommands 的序列化开销）：
     // 每一帧打印信封摘要 + msgDetail 精简版（text/reasoningText/reference
